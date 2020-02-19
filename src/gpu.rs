@@ -71,7 +71,7 @@ fn materialize_kernel(task: &Task) -> String {
         std::fs::read_to_string(&tp).expect(&format!("could not kernel template at path: {}", &tp));
 
     match task.kernel_type {
-        KernelType::Threadgroup => {
+        KernelType::Threadgroup | KernelType::Shuffle => {
             kernel = kernel.replace("~NUM_BMS~", &format!("{}", task.num_bms));
             kernel = kernel.replace("~WG_SIZE~", &format!("{}", task.workgroup_size[0]));
         }
@@ -139,12 +139,15 @@ fn execute_task<B: hal::Backend>(instance_name: String, task: &mut Task, num_exe
     let adapter = instance
         .enumerate_adapters()
         .into_iter()
+        //.skip(1)
         .find(|a| {
             a.queue_families
                 .iter()
                 .any(|family| family.queue_type().supports_compute())
         })
         .expect("Failed to find a GPU with compute support!");
+    println!("{}", adapter.info.name);
+    let ts_grain = if adapter.info.name.starts_with("Intel") { 83.333e-6 } else { 1e-6 };
 
     let memory_properties = adapter.physical_device.memory_properties();
     // we pray that this adapter's graphics/compute queues also support timestamp queries
@@ -163,9 +166,13 @@ fn execute_task<B: hal::Backend>(instance_name: String, task: &mut Task, num_exe
     let queue_group = gpu.queue_groups.first_mut().unwrap();
 
     let glsl = materialize_kernel(task);
+    println!("compiling");
     let file = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Compute).unwrap();
+    println!("reading spirv");
     let spirv: Vec<u32> = pso::read_spirv(file).unwrap();
+    println!("creating shader module, spirv size = {}", spirv.len());
     let kmod = unsafe { device.create_shader_module(&spirv) }.unwrap();
+    println!("shader module created");
 
     let (pipeline_layout, pipeline, set_layout, mut desc_pool) = {
         let set_layout = unsafe {
@@ -233,6 +240,7 @@ fn execute_task<B: hal::Backend>(instance_name: String, task: &mut Task, num_exe
         );
         device.unmap_memory(&staging_mem);
     }
+    println!("flat_raw_bms size = {}", flat_raw_bms.len());
 
     let (device_mem, device_buf, _device_buffer_size) = unsafe {
         create_buffer::<B>(
@@ -253,15 +261,16 @@ fn execute_task<B: hal::Backend>(instance_name: String, task: &mut Task, num_exe
 
     assert_eq!(task.num_bms % task.workgroup_size[0], 0);
     let num_dispatch_groups = task.num_bms / task.workgroup_size[0];
+    let desc_set = unsafe { desc_pool.allocate_set(&set_layout).unwrap() };
     for _ in 0..num_execs {
         unsafe {
-            let desc_set = desc_pool.allocate_set(&set_layout).unwrap();
             device.write_descriptor_sets(Some(pso::DescriptorSetWrite {
                 set: &desc_set,
                 binding: 0,
                 array_offset: 0,
                 descriptors: Some(pso::Descriptor::Buffer(&device_buf, None..None)),
             }));
+            cmd_pool.reset(true);
             let mut cmd_buf = cmd_pool.allocate_one(command::Level::Primary);
             cmd_buf.begin_primary(command::CommandBufferFlags::ONE_TIME_SUBMIT);
             cmd_buf.reset_query_pool(&query_pool, 0..2);
@@ -286,7 +295,7 @@ fn execute_task<B: hal::Backend>(instance_name: String, task: &mut Task, num_exe
                 }),
             );
             cmd_buf.bind_compute_pipeline(&pipeline);
-            cmd_buf.bind_compute_descriptor_sets(&pipeline_layout, 0, &[desc_set], &[]);
+            cmd_buf.bind_compute_descriptor_sets(&pipeline_layout, 0, [&desc_set].iter().cloned(), &[]);
             cmd_buf.write_timestamp(
                 pso::PipelineStage::COMPUTE_SHADER,
                 query::Query {
@@ -319,18 +328,21 @@ fn execute_task<B: hal::Backend>(instance_name: String, task: &mut Task, num_exe
                 &[command::BufferCopy {
                     src: 0,
                     dst: 0,
-                    size: stride * bms.len() as u64,
+                    size: stride * flat_raw_bms.len() as u64,
                 }],
             );
             cmd_buf.finish();
 
+            let start = std::time::Instant::now();
             queue_group.queues[0].submit_without_semaphores(Some(&cmd_buf), Some(&fence));
 
             device.wait_for_fence(&fence, !0).unwrap();
+            println!("elapsed: {:?}", start.elapsed());
             cmd_pool.free(Some(cmd_buf));
         }
 
         let (result, ts) = unsafe {
+            println!("staging size = {}", staging_size);
             let mapping = device.map_memory(&staging_mem, 0..staging_size).unwrap();
             let r = Vec::<u32>::from(slice::from_raw_parts::<u32>(
                 mapping as *const u8 as *const u32,
@@ -356,14 +368,20 @@ fn execute_task<B: hal::Backend>(instance_name: String, task: &mut Task, num_exe
                     .expect("could not construct BitMatrix from u32 slice")
             })
             .collect();
-        println!("{}", &bms[0]);
-        println!("{}", &result_bms[0]);
+        println!("{}", &bms[1]);
+        println!("{}", &result_bms[1]);
+        for i in 0..bms.len() {
+            if !bms[i].transpose().identical_to(&result_bms[i]) {
+                println!("fail at {}", i);
+                panic!();
+            }
+        }
         assert!(bms
             .iter()
             .zip(result_bms.iter())
             .all(|(bm, rbm)| bm.transpose().identical_to(rbm)));
-        println!("GPU results verified!");
-        task.dispatch_times.push((ts[1] - ts[0]) as f64);
+        println!("GPU results verified!, {} +{}", ts[0], ts[1].wrapping_sub(ts[0]));
+        task.dispatch_times.push((ts[1].wrapping_sub(ts[0])) as f64 * ts_grain);
     }
 
     unsafe {

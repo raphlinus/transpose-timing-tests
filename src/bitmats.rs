@@ -78,11 +78,11 @@ impl fmt::Display for BitMatrix {
         let mut string_repr = String::new();
         for (i, u) in self.as_u32s().iter().enumerate() {
             if (i == 0) {
-                write!(string_repr, "[{}, ", u).unwrap();
+                write!(string_repr, "[{:x}, ", u).unwrap();
             } else if (i == 31) {
-                write!(string_repr, "{}]", u).unwrap();
+                write!(string_repr, "{:x}]", u).unwrap();
             } else {
-                write!(string_repr, "{}, ", u).unwrap();
+                write!(string_repr, "{:x}, ", u).unwrap();
             }
         }
         write!(f, "{}", string_repr)
